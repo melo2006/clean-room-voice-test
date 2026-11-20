@@ -60,7 +60,7 @@ Speak naturally, like a person talking, in fairly short turns. Keep your opening
         return;
       }
 
-      const ai = new GoogleGenAI({ apiKey });
+      const ai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1beta' } });
       geminiSession = await ai.live.connect({
         model: MODEL,
         config: {
