@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { SimliClient, LogLevel } from 'simli-client';
+import { installWebSocketUrlStringShim } from './ensureWebSocketUrlString';
 
 /**
  * CLEAN-ROOM VOICE TEST — the whole app is this one file (plus a stylesheet).
@@ -188,6 +189,9 @@ export default function App() {
     youRef.current = ''; adaRef.current = '';
     setYouPartial(''); setAdaPartial('');
     try {
+      // AI Studio's preview wrapper intercepts WebSocket and assumes string
+      // URLs; Simli/LiveKit pass URL objects. Install the shim first.
+      installWebSocketUrlStringShim();
       setStatus('Loading the book…');
       const knowledge = await (await fetch('/knowledge.txt')).text();
 
