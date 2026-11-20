@@ -1,0 +1,8 @@
+{
+  "name": "Clean-Room Voice Test — The Time Machine",
+  "description": "An isolated voice test app with Gemini Live and Simli face, using H. G. Wells' The Time Machine as its sole knowledge source.",
+  "requestor": "melo2006",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

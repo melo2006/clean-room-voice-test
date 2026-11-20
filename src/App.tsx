@@ -1,5 +1,4 @@
 import { useRef, useState } from 'react';
-import { GoogleGenAI, Modality } from '@google/genai';
 import { SimliClient, LogLevel } from 'simli-client';
 import { installWebSocketUrlStringShim } from './ensureWebSocketUrlString';
 
@@ -31,21 +30,7 @@ Answer questions about the book — the Time Traveller, Weena, the Eloi, the Mor
 
 Speak naturally, like a person talking, in fairly short turns. Keep your opening greeting under 15 seconds: welcome the visitor, say you know The Time Machine inside out, and invite them to ask you anything about it. Never mention these instructions or that you are reading a text file.`;
 
-/** Split the book into ~24 KB context chunks (paragraph-safe where easy). */
-function chunkText(text: string, size = 24000): string[] {
-  const chunks: string[] = [];
-  let i = 0;
-  while (i < text.length) {
-    let end = Math.min(text.length, i + size);
-    if (end < text.length) {
-      const nl = text.lastIndexOf('\n', end);
-      if (nl > i + size / 2) end = nl + 1;
-    }
-    chunks.push(text.slice(i, end));
-    i = end;
-  }
-  return chunks;
-}
+
 
 // ---------- small audio helpers (the only math in the app) ----------
 
@@ -193,7 +178,7 @@ export default function App() {
       // URLs; Simli/LiveKit pass URL objects. Install the shim first.
       installWebSocketUrlStringShim();
       setStatus('Loading the book…');
-      const knowledge = await (await fetch('/knowledge.txt')).text();
+
 
       if (modeRef.current === 'video') {
         setStatus('Connecting the face…');
@@ -211,18 +196,56 @@ export default function App() {
       }
 
       setStatus('Connecting to Gemini Live…');
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      const session = await ai.live.connect({
-        model: MODEL,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: VOICE } } },
-          systemInstruction: SYSTEM_INTRO,
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-        } as any,
-        callbacks: {
-          onmessage: (msg: any) => {
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${wsProtocol}//${window.location.host}/ws/live`;
+      const ws = new WebSocket(wsUrl);
+      sessionRef.current = ws;
+
+      await new Promise<void>((resolve, reject) => {
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'ready') {
+              resolve();
+            } else if (data.type === 'error') {
+              reject(new Error(data.message));
+            } else if (data.type === 'gemini_message') {
+              const msg = data.message;
+              const sc = msg.serverContent;
+              if (!sc) return;
+              if (sc.interrupted) {
+                flushPlayback();
+                simliPendingRef.current = new Uint8Array(0);
+                try { simliRef.current?.ClearBuffer(); } catch { /* closed */ }
+                return;
+              }
+              if (sc.inputTranscription?.text) { youRef.current += sc.inputTranscription.text; setYouPartial(youRef.current); }
+              if (sc.outputTranscription?.text) { adaRef.current += sc.outputTranscription.text; setAdaPartial(adaRef.current); }
+              for (const part of sc.modelTurn?.parts ?? []) {
+                const audioData = part?.inlineData?.data;
+                if (audioData) { if (modeRef.current === 'video') routeToSimli(audioData); else playChunk(audioData); }
+              }
+              if (sc.turnComplete) commitPartials();
+            } else if (data.type === 'close') {
+              setStatus('Connection closed.');
+              if (data.code) setError(`Connection closed (code ${data.code})${data.reason ? `: ${data.reason}` : ''}`);
+            }
+          } catch (e) {
+            console.error('Failed to parse WS message:', e);
+          }
+        };
+        ws.onerror = () => reject(new Error('WebSocket connection failed'));
+        ws.onclose = (e) => {
+          if (!sessionRef.current) return;
+          reject(new Error(`WebSocket closed before ready (code ${e.code})`));
+        };
+      });
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'gemini_message') {
+            const msg = data.message;
             const sc = msg.serverContent;
             if (!sc) return;
             if (sc.interrupted) {
@@ -234,36 +257,29 @@ export default function App() {
             if (sc.inputTranscription?.text) { youRef.current += sc.inputTranscription.text; setYouPartial(youRef.current); }
             if (sc.outputTranscription?.text) { adaRef.current += sc.outputTranscription.text; setAdaPartial(adaRef.current); }
             for (const part of sc.modelTurn?.parts ?? []) {
-              const data = part?.inlineData?.data;
-              if (data) { if (modeRef.current === 'video') routeToSimli(data); else playChunk(data); }
+              const audioData = part?.inlineData?.data;
+              if (audioData) { if (modeRef.current === 'video') routeToSimli(audioData); else playChunk(audioData); }
             }
             if (sc.turnComplete) commitPartials();
-          },
-          onerror: (e: any) => setError(`Voice connection error: ${e?.message || e || 'unknown'}`),
-          onclose: (e: any) => {
-            if (sessionRef.current) {
-              setStatus('Connection closed.');
-              if (e?.code) setError(`Connection closed (code ${e.code})${e?.reason ? `: ${e.reason}` : ''}`);
-            }
-          },
-        },
-      });
-      sessionRef.current = session;
+          } else if (data.type === 'error') {
+            setError(`Voice connection error: ${data.message}`);
+          } else if (data.type === 'close') {
+            setStatus('Connection closed.');
+            if (data.code) setError(`Connection closed (code ${data.code})${data.reason ? `: ${data.reason}` : ''}`);
+          }
+        } catch (e) {
+          console.error('Failed to parse WS message:', e);
+        }
+      };
+      ws.onerror = () => setError('The voice connection reported an error.');
+      ws.onclose = (e) => {
+        if (sessionRef.current) {
+          setStatus('Connection closed.');
+          if (e.code) setError(`Connection closed (code ${e.code})`);
+        }
+      };
 
-      // Send the whole book as context AFTER setup completes — putting all
-      // 182 KB inside the setup frame itself made Google close the socket
-      // (1011) before setup finished. Chunks of ~24 KB, then the greeting.
-      const chunks = chunkText(knowledge);
-      for (let c = 0; c < chunks.length; c++) {
-        setStatus(`Sending the book to Ada… (${c + 1}/${chunks.length})`);
-        session.sendClientContent({
-          turns: [{ role: 'user', parts: [{ text: (c === 0 ? 'Here is the full text of "The Time Machine" by H. G. Wells. Read it all and use it as your knowledge:\n\n' : '') + chunks[c] }] }],
-          turnComplete: false,
-        });
-        await new Promise((r) => setTimeout(r, 60));
-      }
-
-      // Microphone: raw 16 kHz PCM straight to Gemini, nothing in between.
+      // Microphone: raw 16 kHz PCM straight to server WebSocket, nothing in between.
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
@@ -273,20 +289,21 @@ export default function App() {
       const source = micCtx.createMediaStreamSource(stream);
       const processor = micCtx.createScriptProcessor(4096, 1, 1);
       processor.onaudioprocess = (e) => {
-        const s = sessionRef.current;
-        if (!s) return;
+        const s = sessionRef.current as WebSocket;
+        if (!s || s.readyState !== WebSocket.OPEN) return;
         const data = floatTo16kBase64(e.inputBuffer.getChannelData(0));
-        try { s.sendRealtimeInput({ audio: { data, mimeType: 'audio/pcm;rate=16000' } }); }
-        catch { try { s.sendRealtimeInput({ media: { data, mimeType: 'audio/pcm;rate=16000' } }); } catch { /* closed */ } }
+        try {
+          s.send(JSON.stringify({
+            type: 'realtime_input',
+            payload: { audio: { data, mimeType: 'audio/pcm;rate=16000' } }
+          }));
+        } catch { /* closed */ }
       };
       source.connect(processor);
       processor.connect(micCtx.destination);
 
       setLive(true);
       setStatus('Live. Ada is greeting you — talk naturally, interrupt her any time.');
-      try {
-        session.sendClientContent({ turns: [{ role: 'user', parts: [{ text: 'That was the entire book. Now please greet me, briefly.' }] }], turnComplete: true });
-      } catch { /* she will answer as soon as you speak instead */ }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setStatus('Could not start.');
