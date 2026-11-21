@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 import { SimliClient, LogLevel } from 'simli-client';
 import { installWebSocketUrlStringShim } from './ensureWebSocketUrlString';
+import { startChromaKey } from './chromaKey';
 
 /**
  * CLEAN-ROOM VOICE TEST — the whole app is this one file (plus a stylesheet).
@@ -15,6 +16,14 @@ import { installWebSocketUrlStringShim } from './ensureWebSocketUrlString';
  * the same public endpoint the production site already uses, so no Simli
  * API key exists in this app at all. The Gemini key is the one AI Studio
  * provisions for this project (process.env.GEMINI_API_KEY).
+ *
+ * ROUND 2 (2026-11-20, Ron's request): same clean pipeline, now wearing the
+ * product's clothes — the big app's OWN WebGL chroma key (src/chromaKey.ts,
+ * copied verbatim) makes her float transparent over the live AiHiddenLeads
+ * website embedded behind the panel, and the product control set is added:
+ * speaker mute, mic mute, and a noise gate for noisy rooms. The controls
+ * write only refs and a meter div — they never touch React state per audio
+ * chunk, so the audio path stays exactly as lean as the smooth Round 1.
  */
 
 const MODEL = 'gemini-3.8-live';
@@ -65,6 +74,13 @@ function pcm24kTo16k(input: Int16Array): Int16Array {
   return out;
 }
 
+/** One silent mic frame, same byte size as a real 4096-sample block. Sent when
+ * the mic is muted or the noise gate is closed, so the session hears clean
+ * silence instead of the room — the same trick the big app uses. */
+const SILENT_FRAME_B64 = floatTo16kBase64(new Float32Array(4096));
+/** RMS below this counts as "room noise, not speech" when the gate is on. */
+const GATE_RMS = 0.02;
+
 // ---------- the app ----------
 
 interface Line { who: string; text: string }
@@ -78,8 +94,18 @@ export default function App() {
   const [lines, setLines] = useState<Line[]>([]);
   const [youPartial, setYouPartial] = useState('');
   const [adaPartial, setAdaPartial] = useState('');
+  const [speakerMuted, setSpeakerMuted] = useState(false);
+  const [micMuted, setMicMuted] = useState(false);
+  const [gateOn, setGateOn] = useState(true);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const keyStopRef = useRef<(() => void) | null>(null);
+  const meterRef = useRef<HTMLDivElement>(null);
+  const gateLabelRef = useRef<HTMLSpanElement>(null);
+  const speakerMutedRef = useRef(false);
+  const micMutedRef = useRef(false);
+  const gateOnRef = useRef(true);
   const audioRef = useRef<HTMLAudioElement>(null);
   const sessionRef = useRef<any>(null);
   const simliRef = useRef<SimliClient | null>(null);
@@ -97,6 +123,7 @@ export default function App() {
 
   // ----- playback (voice-only mode): simple scheduled queue, nothing else -----
   function playChunk(b64: string) {
+    if (speakerMutedRef.current) return;
     const ctx = playCtxRef.current;
     if (!ctx) return;
     if (ctx.state === 'suspended') void ctx.resume().catch(() => {});
@@ -188,9 +215,14 @@ export default function App() {
         const client = new SimliClient(token, videoRef.current, audioRef.current, null, LogLevel.ERROR, 'livekit' as any);
         simliRef.current = client;
         await (client as any).start();
-        audioRef.current.muted = false;
+        audioRef.current.muted = speakerMutedRef.current;
         audioRef.current.volume = 1;
         await audioRef.current.play().catch(() => {});
+        // The big app's own WebGL chroma key: cuts the green away so she
+        // floats over the page, exactly like production.
+        if (canvasRef.current) {
+          keyStopRef.current = startChromaKey(videoRef.current, canvasRef.current);
+        }
       } else {
         playCtxRef.current = new AudioContext({ sampleRate: 24000 });
         // Android Chrome can start an AudioContext suspended when it is created
@@ -296,7 +328,23 @@ export default function App() {
       processor.onaudioprocess = (e) => {
         const s = sessionRef.current as WebSocket;
         if (!s || s.readyState !== WebSocket.OPEN) return;
-        const data = floatTo16kBase64(e.inputBuffer.getChannelData(0));
+        const ch = e.inputBuffer.getChannelData(0);
+        // Cheap level check (every 4th sample) for the noise gate + meter.
+        // The meter is a plain div written directly — no React state, so the
+        // audio path stays as lean as Round 1.
+        let sum = 0;
+        for (let i = 0; i < ch.length; i += 4) sum += ch[i] * ch[i];
+        const rms = Math.sqrt(sum / (ch.length / 4));
+        if (meterRef.current) meterRef.current.style.width = `${Math.min(100, Math.round(rms * 400))}%`;
+        const gated = gateOnRef.current && rms < GATE_RMS;
+        if (gateLabelRef.current) {
+          gateLabelRef.current.textContent = micMutedRef.current
+            ? 'mic muted — she hears silence'
+            : gated
+              ? 'noise gate CLOSED — room noise is blocked, she hears silence'
+              : 'noise gate open — your voice is passing';
+        }
+        const data = micMutedRef.current || gated ? SILENT_FRAME_B64 : floatTo16kBase64(ch);
         try {
           s.send(JSON.stringify({
             type: 'realtime_input',
@@ -319,6 +367,8 @@ export default function App() {
   }
 
   async function stop() {
+    keyStopRef.current?.();
+    keyStopRef.current = null;
     sessionRef.current?.close?.();
     sessionRef.current = null;
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -338,20 +388,45 @@ export default function App() {
     setStatus('Stopped. Tap Start talking to go again.');
   }
 
+  function toggleSpeaker() {
+    const next = !speakerMuted;
+    setSpeakerMuted(next);
+    speakerMutedRef.current = next;
+    if (audioRef.current) audioRef.current.muted = next;
+  }
+
+  function toggleMic() {
+    const next = !micMuted;
+    setMicMuted(next);
+    micMutedRef.current = next;
+  }
+
+  function toggleGate() {
+    const next = !gateOn;
+    setGateOn(next);
+    gateOnRef.current = next;
+  }
+
   return (
-    <div className="page">
-      <h1>Clean-Room Voice Test</h1>
+    <>
+      <iframe className="site-bg" src="https://aihiddenleads.com" title="AiHiddenLeads website, live behind the test panel" />
+      <div className="bg-shade" />
+      <div className="page">
+      <h1>Clean-Room Voice Test — Round 2</h1>
       <p className="sub">
-        One tiny app. Gemini Live + a Simli face, and exactly one knowledge source:
-        the full text of <i>The Time Machine</i> by H. G. Wells (32,306 words).
-        Nothing else is in here — that is the point of the test.
+        Same clean pipeline that ran perfectly smooth in Round 1 — now wearing the
+        product's clothes. She floats <b>transparent</b> over your real website (live
+        behind this panel) using the big app's own chroma key, and the full control
+        set is in: speaker mute, mic mute, and a noise gate for noisy rooms.
+        Knowledge is still exactly one book: <i>The Time Machine</i> by H. G. Wells.
       </p>
 
       <div className="panel">
         {mode === 'video' && (
           <div className="video-wrap">
             <div className="video-box">
-              <video ref={videoRef} autoPlay playsInline muted />
+              <video ref={videoRef} className="src-video" autoPlay playsInline muted />
+              <canvas ref={canvasRef} className="face-canvas" />
             </div>
             <audio ref={audioRef} autoPlay />
           </div>
@@ -374,6 +449,24 @@ export default function App() {
           </button>
         </div>
 
+        <div className="controls-row">
+          <button className={speakerMuted ? 'off' : 'on'} onClick={toggleSpeaker}>
+            {speakerMuted ? '🔇 Speaker off' : '🔊 Speaker on'}
+          </button>
+          <button className={micMuted ? 'off' : 'on'} onClick={toggleMic}>
+            {micMuted ? '🎤 Mic muted' : '🎤 Mic live'}
+          </button>
+          <button className={gateOn ? 'on' : 'off'} onClick={toggleGate}>
+            {gateOn ? 'Noise gate: ON' : 'Noise gate: OFF'}
+          </button>
+        </div>
+        {live && (
+          <div className="meter-row">
+            <div className="meter"><div ref={meterRef} className="meter-fill" /></div>
+            <span ref={gateLabelRef} className="gate-label">mic level</span>
+          </div>
+        )}
+
         <p className="status">{status}</p>
         {error && <p className="error">{error}</p>}
 
@@ -393,8 +486,10 @@ export default function App() {
 
       <p className="footer">
         Model: gemini-3.8-live · Voice: Kore (same as Aspen) · Face: same Simli face as the live site ·
+        Transparency: the big app's own WebGL chroma key, copied in unchanged · Background: your live website ·
         Knowledge: one book, loaded whole — no database, no retrieval, no other integrations.
       </p>
-    </div>
+      </div>
+    </>
   );
 }
