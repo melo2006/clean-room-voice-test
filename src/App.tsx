@@ -24,6 +24,13 @@ import { startChromaKey } from './chromaKey';
  * speaker mute, mic mute, and a noise gate for noisy rooms. The controls
  * write only refs and a meter div — they never touch React state per audio
  * chunk, so the audio path stays exactly as lean as the smooth Round 1.
+ *
+ * ROUND 3 (2026-11-20, Ron's request): the presentation is now the production
+ * chat box itself — a 200px circular floating widget (the big app's default
+ * avatar size/shape/position family) with NO opaque panel behind her, so the
+ * website shows through; top-row grip/minimize/close, Voice/Type toggle,
+ * and the control bar (mic, speaker, captions, replay-from-cache with the
+ * mic paused, noise gate, end). Test scaffolding moved to a separate card.
  */
 
 const MODEL = 'gemini-3.8-live';
@@ -97,6 +104,14 @@ export default function App() {
   const [speakerMuted, setSpeakerMuted] = useState(false);
   const [micMuted, setMicMuted] = useState(false);
   const [gateOn, setGateOn] = useState(true);
+  const [captionsOn, setCaptionsOn] = useState(false);
+  const [minimized, setMinimized] = useState(false);
+  const [inputMode, setInputMode] = useState<'voice' | 'type'>('voice');
+  const [typedText, setTypedText] = useState('');
+  const turnChunksRef = useRef<string[]>([]);
+  const lastAdaChunksRef = useRef<string[]>([]);
+  const capturePausedRef = useRef(false);
+  const inputModeRef = useRef<'voice' | 'type'>('voice');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -123,6 +138,7 @@ export default function App() {
 
   // ----- playback (voice-only mode): simple scheduled queue, nothing else -----
   function playChunk(b64: string) {
+    turnChunksRef.current.push(b64);
     if (speakerMutedRef.current) return;
     const ctx = playCtxRef.current;
     if (!ctx) return;
@@ -156,6 +172,7 @@ export default function App() {
   }
 
   function routeToSimli(b64: string) {
+    turnChunksRef.current.push(b64);
     const pcm = new Uint8Array(pcm24kTo16k(base64ToInt16(b64)).buffer);
     const merged = new Uint8Array(simliPendingRef.current.length + pcm.length);
     merged.set(simliPendingRef.current);
@@ -171,6 +188,10 @@ export default function App() {
   }
 
   function commitPartials() {
+    if (turnChunksRef.current.length) {
+      lastAdaChunksRef.current = turnChunksRef.current;
+      turnChunksRef.current = [];
+    }
     const done: Line[] = [];
     if (youRef.current.trim()) done.push({ who: 'You', text: youRef.current.trim() });
     if (adaRef.current.trim()) done.push({ who: 'Ada', text: adaRef.current.trim() });
@@ -340,11 +361,17 @@ export default function App() {
         if (gateLabelRef.current) {
           gateLabelRef.current.textContent = micMutedRef.current
             ? 'mic muted — she hears silence'
-            : gated
-              ? 'noise gate CLOSED — room noise is blocked, she hears silence'
-              : 'noise gate open — your voice is passing';
+            : capturePausedRef.current
+              ? 'replaying her last line — mic paused so she cannot hear herself'
+              : inputModeRef.current === 'type'
+                ? 'type mode — mic is off, use the text box in the widget'
+                : gated
+                  ? 'noise gate CLOSED — room noise is blocked, she hears silence'
+                  : 'noise gate open — your voice is passing';
         }
-        const data = micMutedRef.current || gated ? SILENT_FRAME_B64 : floatTo16kBase64(ch);
+        const data = micMutedRef.current || gated || capturePausedRef.current || inputModeRef.current === 'type'
+          ? SILENT_FRAME_B64
+          : floatTo16kBase64(ch);
         try {
           s.send(JSON.stringify({
             type: 'realtime_input',
@@ -384,6 +411,9 @@ export default function App() {
     simliRef.current = null;
     if (client) { try { await (client as any).stop(); } catch { /* already closed */ } }
     commitPartials();
+    turnChunksRef.current = [];
+    lastAdaChunksRef.current = [];
+    capturePausedRef.current = false;
     setLive(false);
     setStatus('Stopped. Tap Start talking to go again.');
   }
@@ -407,88 +437,139 @@ export default function App() {
     gateOnRef.current = next;
   }
 
+  /** Production behaviour: replay her last line from the local cache with the
+   * mic paused, so she cannot hear herself and no new session usage is spent. */
+  function replayLast() {
+    const chunks = lastAdaChunksRef.current;
+    if (!live || !chunks.length || capturePausedRef.current) return;
+    capturePausedRef.current = true;
+    let totalSamples = 0;
+    if (modeRef.current === 'video') {
+      simliPendingRef.current = new Uint8Array(0);
+      try { simliRef.current?.ClearBuffer(); } catch { /* closed */ }
+      for (const c of chunks) { totalSamples += base64ToInt16(c).length; routeToSimli(c); }
+    } else {
+      flushPlayback();
+      for (const c of chunks) { totalSamples += base64ToInt16(c).length; playChunk(c); }
+    }
+    const ms = (totalSamples / 24000) * 1000 + 500;
+    setTimeout(() => { capturePausedRef.current = false; }, ms);
+  }
+
+  function sendTyped() {
+    const text = typedText.trim();
+    const ws = sessionRef.current as WebSocket | null;
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+    setTypedText('');
+    youRef.current = text;
+    commitPartials();
+    try {
+      ws.send(JSON.stringify({
+        type: 'client_content',
+        payload: { turns: [{ role: 'user', parts: [{ text }] }], turnComplete: true },
+      }));
+    } catch { /* closed */ }
+  }
+
+  const lastAdaLine = [...lines].reverse().find((l) => l.who === 'Ada')?.text ?? '';
+  const captionText = adaPartial || lastAdaLine;
+
   return (
     <>
-      <iframe className="site-bg" src="https://aihiddenleads.com" title="AiHiddenLeads website, live behind the test panel" />
-      <div className="bg-shade" />
-      <div className="page">
-      <h1>Clean-Room Voice Test — Round 2</h1>
-      <p className="sub">
-        Same clean pipeline that ran perfectly smooth in Round 1 — now wearing the
-        product's clothes. She floats <b>transparent</b> over your real website (live
-        behind this panel) using the big app's own chroma key, and the full control
-        set is in: speaker mute, mic mute, and a noise gate for noisy rooms.
-        Knowledge is still exactly one book: <i>The Time Machine</i> by H. G. Wells.
-      </p>
+      <iframe className="site-bg" src="https://aihiddenleads.com" title="AiHiddenLeads website, live behind the test widget" />
 
-      <div className="panel">
-        {mode === 'video' && (
-          <div className="video-wrap">
-            <div className="video-box">
-              <video ref={videoRef} className="src-video" autoPlay playsInline muted />
-              <canvas ref={canvasRef} className="face-canvas" />
-            </div>
-            <audio ref={audioRef} autoPlay />
-          </div>
-        )}
-        {mode === 'voice' && (
-          <>
-            <video ref={videoRef} autoPlay playsInline muted style={{ display: 'none' }} />
-            <audio ref={audioRef} autoPlay style={{ display: 'none' }} />
-          </>
-        )}
-
+      <div className="testcard">
+        <h1>Clean-Room Test — Round 3</h1>
+        <p className="tc-sub">
+          The widget at the bottom right is built like the real one: production size,
+          production controls, and she floats transparent — your live website shows
+          through her and around her. Everything in this card is test scaffolding,
+          not part of the widget. Knowledge is still one book: <i>The Time Machine</i>.
+        </p>
         <div className="toggle-row">
           <button className={mode === 'video' ? 'on' : ''} disabled={live || busy} onClick={() => setMode('video')}>Video + voice</button>
           <button className={mode === 'voice' ? 'on' : ''} disabled={live || busy} onClick={() => setMode('voice')}>Voice only</button>
         </div>
-
         <div className="start-row">
           <button className={`start-btn${live ? ' live' : ''}`} disabled={busy} onClick={() => (live ? stop() : start())}>
             {busy ? 'Connecting…' : live ? 'Stop' : 'Start talking'}
           </button>
         </div>
-
-        <div className="controls-row">
-          <button className={speakerMuted ? 'off' : 'on'} onClick={toggleSpeaker}>
-            {speakerMuted ? '🔇 Speaker off' : '🔊 Speaker on'}
-          </button>
-          <button className={micMuted ? 'off' : 'on'} onClick={toggleMic}>
-            {micMuted ? '🎤 Mic muted' : '🎤 Mic live'}
-          </button>
-          <button className={gateOn ? 'on' : 'off'} onClick={toggleGate}>
-            {gateOn ? 'Noise gate: ON' : 'Noise gate: OFF'}
-          </button>
-        </div>
+        <p className="status">{status}</p>
+        {error && <p className="error">{error}</p>}
         {live && (
           <div className="meter-row">
             <div className="meter"><div ref={meterRef} className="meter-fill" /></div>
             <span ref={gateLabelRef} className="gate-label">mic level</span>
           </div>
         )}
-
-        <p className="status">{status}</p>
-        {error && <p className="error">{error}</p>}
-
         <div className="transcript">
           {lines.length === 0 && !youPartial && !adaPartial && <p className="empty">The transcript will appear here as you talk.</p>}
           {lines.map((l, i) => <p key={i}><span className="who">{l.who}:</span> {l.text}</p>)}
           {youPartial && <p><span className="who">You:</span> {youPartial}</p>}
           {adaPartial && <p><span className="who">Ada:</span> {adaPartial}</p>}
         </div>
+        <p className="tc-foot">
+          Ask her: Who is Weena? · What year does he travel to? · Eloi and Morlocks? ·
+          Palace of Green Porcelain? · How does the book end?
+        </p>
       </div>
 
-      <div className="ideas">
-        <b>Questions she should nail:</b> Who is Weena? · What year does the Time Traveller
-        travel to? · What are the Eloi and the Morlocks? · What is the Palace of Green Porcelain? ·
-        How does the book end? · What did he bring back as proof?
-      </div>
+      <div className={`widget${minimized ? ' minimized' : ''}`}>
+        <div className="widget-tag">CLEAN-ROOM TEST</div>
+        <div className="face-frame" onClick={() => { if (!live && !busy) void start(); }}>
+          {mode === 'video' ? (
+            <>
+              <video ref={videoRef} className="src-video" autoPlay playsInline muted />
+              <canvas ref={canvasRef} className="face-canvas" />
+              {!live && <img className="idle-face" src="/ada-idle.png" alt="Ada" />}
+              <audio ref={audioRef} autoPlay />
+            </>
+          ) : (
+            <>
+              <video ref={videoRef} autoPlay playsInline muted style={{ display: 'none' }} />
+              <audio ref={audioRef} autoPlay style={{ display: 'none' }} />
+              <img className="idle-face" src="/ada-idle.png" alt="Ada" />
+            </>
+          )}
+          {live && (
+            <div className="widget-toprow">
+              <span className="grip" title="Drag handle (decorative in this test)">⠿</span>
+              <button title="Minimize — the call keeps running" onClick={(e) => { e.stopPropagation(); setMinimized(true); }}>–</button>
+              <button title="End the call" onClick={(e) => { e.stopPropagation(); void stop(); }}>✕</button>
+            </div>
+          )}
+        </div>
 
-      <p className="footer">
-        Model: gemini-3.8-live · Voice: Kore (same as Aspen) · Face: same Simli face as the live site ·
-        Transparency: the big app's own WebGL chroma key, copied in unchanged · Background: your live website ·
-        Knowledge: one book, loaded whole — no database, no retrieval, no other integrations.
-      </p>
+        {!minimized && live && (
+          <>
+            <div className="vt-row">
+              <button className={inputMode === 'voice' ? 'on' : ''} onClick={() => { setInputMode('voice'); inputModeRef.current = 'voice'; }}>🎙 Voice</button>
+              <button className={inputMode === 'type' ? 'on' : ''} onClick={() => { setInputMode('type'); inputModeRef.current = 'type'; }}>⌨ Type</button>
+            </div>
+            {inputMode === 'type' && (
+              <div className="type-row">
+                <input value={typedText} onChange={(e) => setTypedText(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') sendTyped(); }}
+                  placeholder="Type a question about the book…" />
+                <button onClick={sendTyped}>Send</button>
+              </div>
+            )}
+            <div className="widget-controls">
+              <button className={micMuted ? 'off' : 'on'} title="Microphone on/off" onClick={toggleMic}>{micMuted ? '🎤✕' : '🎤'}</button>
+              <button className={speakerMuted ? 'off' : 'on'} title="Speaker on/off" onClick={toggleSpeaker}>{speakerMuted ? '🔇' : '🔊'}</button>
+              <button className={captionsOn ? 'on' : 'off'} title="Captions on/off" onClick={() => setCaptionsOn(!captionsOn)}>CC</button>
+              <button title="Replay her last line (from cache, mic paused)" onClick={replayLast}>↩</button>
+              <button className={gateOn ? 'on' : 'off'} title="Noise gate for noisy rooms" onClick={toggleGate}>Noise</button>
+              <button className="end" title="End the call" onClick={() => void stop()}>⏹</button>
+            </div>
+            {captionsOn && captionText && <div className="caption-strip">{captionText}</div>}
+          </>
+        )}
+        {!minimized && !live && <div className="widget-hint">Tap her face to start</div>}
+        {minimized && (
+          <button className="restore" onClick={() => setMinimized(false)}>▲ reopen</button>
+        )}
       </div>
     </>
   );
