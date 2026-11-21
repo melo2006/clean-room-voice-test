@@ -520,10 +520,18 @@ export default function App() {
         <div className="face-frame" onClick={() => { if (!live && !busy) void start(); }}>
           {mode === 'video' ? (
             <>
-              <video ref={videoRef} className="src-video" autoPlay playsInline muted />
-              <canvas ref={canvasRef} className="face-canvas" />
+              {/* The media stack NEVER changes shape: Simli binds its streams to
+                  these exact elements at start(). A conditional sibling among
+                  them makes React remount the <audio> element when `live`
+                  flips — Simli keeps playing into the dead element and the
+                  visitor hears silence (the Round 3 bug). Overlays live
+                  OUTSIDE this stack. */}
+              <div className="media-stack">
+                <video ref={videoRef} className="src-video" autoPlay playsInline muted />
+                <canvas ref={canvasRef} className="face-canvas" />
+                <audio ref={audioRef} autoPlay />
+              </div>
               {!live && <img className="idle-face" src="/ada-idle.png" alt="Ada" />}
-              <audio ref={audioRef} autoPlay />
             </>
           ) : (
             <>
