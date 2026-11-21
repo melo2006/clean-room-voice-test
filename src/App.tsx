@@ -104,6 +104,8 @@ export default function App() {
   const [speakerMuted, setSpeakerMuted] = useState(false);
   const [micMuted, setMicMuted] = useState(false);
   const [gateOn, setGateOn] = useState(true);
+  const [scope, setScope] = useState<'book' | 'open'>('open');
+  const scopeRef = useRef<'book' | 'open'>('open');
   const [captionsOn, setCaptionsOn] = useState(false);
   const [minimized, setMinimized] = useState(false);
   const [inputMode, setInputMode] = useState<'voice' | 'type'>('voice');
@@ -255,7 +257,7 @@ export default function App() {
 
       setStatus('Connecting to Gemini Live…');
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${wsProtocol}//${window.location.host}/ws/live`;
+      const wsUrl = `${wsProtocol}//${window.location.host}/ws/live?scope=${scopeRef.current}`;
       const ws = new WebSocket(wsUrl);
       sessionRef.current = ws;
 
@@ -479,16 +481,21 @@ export default function App() {
       <iframe className="site-bg" src="https://aihiddenleads.com" title="AiHiddenLeads website, live behind the test widget" />
 
       <div className="testcard">
-        <h1>Clean-Room Test — Round 3</h1>
+        <h1>Clean-Room Test — Round 4</h1>
         <p className="tc-sub">
           The widget at the bottom right is built like the real one: production size,
           production controls, and she floats transparent — your live website shows
           through her and around her. Everything in this card is test scaffolding,
-          not part of the widget. Knowledge is still one book: <i>The Time Machine</i>.
+          not part of the widget. Round 4 opens her knowledge: with <b>Book + web
+          search</b> she can look up weather, scores, news — almost anything.
         </p>
         <div className="toggle-row">
           <button className={mode === 'video' ? 'on' : ''} disabled={live || busy} onClick={() => setMode('video')}>Video + voice</button>
           <button className={mode === 'voice' ? 'on' : ''} disabled={live || busy} onClick={() => setMode('voice')}>Voice only</button>
+        </div>
+        <div className="toggle-row">
+          <button className={scope === 'book' ? 'on' : ''} disabled={live || busy} onClick={() => { setScope('book'); scopeRef.current = 'book'; }}>Knowledge: book only</button>
+          <button className={scope === 'open' ? 'on' : ''} disabled={live || busy} onClick={() => { setScope('open'); scopeRef.current = 'open'; }}>Book + web search</button>
         </div>
         <div className="start-row">
           <button className={`start-btn${live ? ' live' : ''}`} disabled={busy} onClick={() => (live ? stop() : start())}>
@@ -510,8 +517,9 @@ export default function App() {
           {adaPartial && <p><span className="who">Ada:</span> {adaPartial}</p>}
         </div>
         <p className="tc-foot">
-          Ask her: Who is Weena? · What year does he travel to? · Eloi and Morlocks? ·
-          Palace of Green Porcelain? · How does the book end?
+          {scope === 'open'
+            ? <>Ask her anything: What's the weather in Fort Lauderdale? · Who won the game last night? · What's in the news today? · A stock price? — plus the book: Who is Weena? · How does it end?</>
+            : <>Ask her: Who is Weena? · What year does he travel to? · Eloi and Morlocks? · Palace of Green Porcelain? · How does the book end?</>}
         </p>
       </div>
 
