@@ -99,6 +99,7 @@ export default function App() {
   function playChunk(b64: string) {
     const ctx = playCtxRef.current;
     if (!ctx) return;
+    if (ctx.state === 'suspended') void ctx.resume().catch(() => {});
     const pcm = base64ToInt16(b64);
     const buffer = ctx.createBuffer(1, pcm.length, 24000);
     const ch = buffer.getChannelData(0);
@@ -192,6 +193,10 @@ export default function App() {
         await audioRef.current.play().catch(() => {});
       } else {
         playCtxRef.current = new AudioContext({ sampleRate: 24000 });
+        // Android Chrome can start an AudioContext suspended when it is created
+        // inside an async handler; without resume() the scheduled sources stay
+        // silent forever (transcripts still flow). Unlock it in the tap flow.
+        void playCtxRef.current.resume().catch(() => {});
         nextTimeRef.current = playCtxRef.current.currentTime;
       }
 
